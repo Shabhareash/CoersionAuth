@@ -19,9 +19,12 @@ log patterns. No JVM, no warmup, starts parsing immediately.
 ## Benchmark — 1000 line syslog file
 ![Benchmark Chart](benchmark.png)
 
-> ~2.5x faster wall clock time on equivalent input and output.
-> At higher log volumes the gap widens further as JVM overhead
-> becomes a smaller fraction of total time.
+> Sample test shows higher gap due to logstash's cold start.
+> At higher log volumes the gap shortens as JVM overhead fades
+> Settles around ~2.5x faster
+
+At large scale logs (>1GB) removing the cold start from both engines the comparison shows :
+![Performance Chart](chart.png)
 
 ## How it works
 
@@ -65,3 +68,7 @@ git clone https://github.com/logstash-plugins/logstash-patterns-core
 ```bash
 cargo build --release
 ```
+## Output Consistency
+Since we are dealing with SIEM, we need to make sure that our logs are consitent with the comparsion (Logstash) since the comparisons are battle tested and proven.
+This image shows the pie chart viusal comparisons of both outputs (RustLogger and Logstash) via Kibana.
+![Output comparison](output.png)
