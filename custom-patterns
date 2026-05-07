@@ -1,0 +1,2 @@
+TIMESTAMP_ISO8601_SHORT %{YEAR}-%{MONTHNUM}-%{MONTHDAY}[T ]%{HOUR}:?%{MINUTE}(?::?%{SECOND})?%{ISO8601_TIMEZONE}?
+SYSTEMD_SYSLOG %{TIMESTAMP_ISO8601_SHORT:timestamp} %{HOSTNAME:[log][syslog][hostname]} %{SYSLOGPROG:[log][syslog][appname](?:\[%{POSINT:[log][syslog][procid]}\])?}:? %{GREEDYDATA:[log][syslog][message]}

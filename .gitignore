@@ -1,0 +1,13 @@
+# Rust
+/target/
+
+# Secrets
+.env
+
+# Logs & outputs
+*.log
+*.json
+*.txt
+
+# Optional
+output.json
