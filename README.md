@@ -1,5 +1,13 @@
 # RustLogger
 
+![RustLogger benchmark](/home/shabh/RustLogger/Rustlogger.png)
+
+A high-performance, zero-copy log ingestion engine written in Rust. Designed as a drop‑in replacement for Logstash/Vector edge agents in high‑throughput SIEM pipelines.
+
+![Vector benchmark](/home/shabh/RustLogger/Vector.png)
+
+
+
 A high-performance, zero-copy log ingestion engine written in Rust. Designed as a drop-in replacement for Logstash/Vector edge agents in high-throughput SIEM pipelines.
 
 Built from scratch by a single developer. Benchmarked at **1.04 million events/sec** (pure parsing) and **548,516 events/sec** sustained end-to-end with real disk I/O — on a laptop i5-10300H.
