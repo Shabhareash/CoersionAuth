@@ -1,11 +1,57 @@
 [package]
 name = "my_scanner"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-grok = { version = "2.4", default-features = false, features = ["pcre2"] }
+# ── SIMD-accelerated string search ──
+aho-corasick = "1.1"
+memchr = "2.7"
+
+# ── YAML config ──
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 serde_json = "1.0"
+
+# ── Regex (generic fallback only) ──
+regex = "1.10"
+grok = { version = "2.4", default-features = false, features = ["pcre2"] }
+
+# ── Time ──
 chrono = "0.4"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# ── HTTP / async ──
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 dotenv = "0.15"
+tokio = { version = "1", features = ["full"] }
+rayon = "1.7"
+mimalloc = { version = "0.1", default-features = false }
+
+# ── Kafka (native librdkafka consumer) ──
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+
+# ── Signal handling (daemon mode) ──
+libc = "0.2"
+tokio-stream = "0.1"
+
+# ── Benchmarking ──
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── Optimal release profile for PCRE2 + hot loop performance ──
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "kafka_pipeline"
+path = "src/bin/kafka_pipeline.rs"
+
+[[bin]]
+name = "kafka_producer"
+path = "src/bin/kafka_producer.rs"
+
+[[bench]]
+name = "pipeline_bench"
+harness = false

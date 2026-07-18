@@ -9,5 +9,9 @@
 *.json
 *.txt
 
+# Do not track large log files
+# !auth_1m.log
+# !OpenSSH_200k.log
+
 # Optional
 output.json

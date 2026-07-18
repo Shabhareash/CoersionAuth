@@ -1,0 +1,81 @@
+version: 1
+
+log_family: web_auth
+
+pipeline:
+  classifier:
+    strategy: aho_corasick
+    fallback: generic_parser
+
+  signatures:
+    - id: cron_session_opened
+      contains:
+        - "session opened for user"
+
+    - id: cron_session_closed
+      contains:
+        - "session closed for user"
+
+  specialized_parsers:
+
+    cron_session_opened:
+      strategy: dissect
+      patterns:
+        # session opened for user www-data(uid=33) by www-data(uid=0)
+        - "session opened for user %{user.name:notspace}(%{user.id}) by %{user.effective.name:notspace}(%{user.effective.id})"
+        # fallback without the "by" part
+        - "session opened for user %{user.name:notspace}(%{user.id})"
+      ecs:
+        static:
+          event.dataset: web_auth
+          event.category: session
+          event.type: start
+          event.action: session_opened
+          event.type_id: cron_session_opened
+
+    cron_session_closed:
+      strategy: dissect
+      patterns:
+        # session closed for user www-data
+        - "session closed for user %{user.name:notspace}"
+      ecs:
+        static:
+          event.dataset: web_auth
+          event.category: session
+          event.type: end
+          event.action: session_closed
+          event.type_id: cron_session_closed
+
+  generic_parser:
+    enabled: true
+    strategy: regex
+
+    patterns:
+      - name: generic_cron
+        regex: 'CRON\[(?P<pid>\d+)\]: (?P<message>.*)'
+
+        ecs:
+          pid: process.pid
+          message: message
+
+  raw_ingestion:
+    enabled: true
+    preserve_original: true
+
+    fields:
+      - event.original
+      - message
+      - host.name
+      - process.name
+      - process.pid
+
+syslog:
+  bsd_format:
+    timestamp_fields: 3
+    hostname_offset: 3
+    process_offset: 4
+
+  iso_format:
+    timestamp_fields: 1
+    hostname_offset: 1
+    process_offset: 2

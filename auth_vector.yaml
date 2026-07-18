@@ -1,0 +1,568 @@
+################################################################################
+#  Vector Pipeline — Auth Log Parser (prod-grade)
+#  Translated from auth.yaml signatures (my_scanner → Vector VRL)
+#  Covers: 28 specialized event types + generic fallback
+#  ECS-aligned | Timestamp-parsed | Buffered | Error-tagged
+################################################################################
+
+data_dir: /var/lib/vector
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOURCE
+# ─────────────────────────────────────────────────────────────────────────────
+sources:
+  auth_logs:
+    type: file
+    include:
+      - /home/shabh/RustLogger/auth_snap.log
+    ignore_checkpoints: true
+    fingerprint:
+      strategy: device_and_inode
+    read_from: beginning
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFORM — Stage 1: Parse ISO syslog header
+# ─────────────────────────────────────────────────────────────────────────────
+transforms:
+  parse_syslog_header:
+    type: remap
+    inputs:
+      - auth_logs
+    source: |
+      .event.original = string!(.message)
+      .log.file.path  = string!(.file)
+      .log_type       = "auth"
+      .tags           = ["vector-pipeline"]
+
+      # ISO syslog: "2026-06-28T00:05:01.831631+00:00 hostname proc[pid]: body"
+      # Also handle proc without pid like (systemd), (sd-pam), login[pid], polkitd[pid]
+      hdr, err = parse_regex(
+        string!(.message),
+        r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{2}:\d{2})\s+(?P<hostname>\S+)\s+(?P<proc>[^\[:]+?)(?:\[(?P<pid>\d+)\])?:\s+(?P<body>.+?)[\r]?$'
+      )
+
+      if err == null {
+        .@timestamp, ts_err = parse_timestamp(hdr.ts, format: "%+")
+        if ts_err != null {
+          .@timestamp = now()
+          .tags = push(.tags, "timestamp-parse-error")
+        }
+        .host.name     = hdr.hostname
+        .host.hostname = hdr.hostname
+        .process.name  = hdr.proc
+        .process.pid   = to_int(hdr.pid) ?? 0
+        ._body         = hdr.body
+        ._parsed_header = true
+      } else {
+        .@timestamp     = now()
+        ._body          = string!(.message)
+        ._parsed_header = false
+        .tags           = push(.tags, "header-parse-error")
+      }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFORM — Stage 2: Classify + parse body (mirrors auth.yaml signatures)
+# ─────────────────────────────────────────────────────────────────────────────
+  parse_auth_body:
+    type: remap
+    inputs:
+      - parse_syslog_header
+    source: |
+      body = string!(._body)
+      proc = string(.process.name) ?? ""
+      .matched = false
+
+      # ══════════════════════ SSH Authentication ══════════════════════
+
+      # ── auth_ssh_success ──
+      if contains(body, "Accepted password for") || contains(body, "Accepted publickey for") {
+        m, err = parse_regex(body, r'^Accepted (?P<method>password|publickey|keyboard-interactive) for (?P<user>\S+) from (?P<ip>[0-9a-f.:]+) port (?P<port>\d+)')
+        if err == null {
+          .user.name         = m.user
+          .source.ip         = m.ip
+          .source.port       = to_int(m.port) ?? 0
+          .event.action      = "login"
+          .event.outcome     = "success"
+          .event.category    = "authentication"
+          .event.type_id     = "auth_ssh_success"
+          .auth.method       = m.method
+          .network.transport = "tcp"
+          .matched           = true
+          ._parse_stage      = "specialized"
+        }
+      }
+
+      # ── auth_ssh_failed ──
+      if !.matched && (contains(body, "Failed password for") || contains(body, "Failed publickey for")) {
+        m, err = parse_regex(body, r'^Failed (?P<method>password|publickey) for (?:invalid user )?(?P<user>\S+) from (?P<ip>[0-9a-f.:]+) port (?P<port>\d+)')
+        if err == null {
+          .user.name         = m.user
+          .source.ip         = m.ip
+          .source.port       = to_int(m.port) ?? 0
+          .event.action      = "login"
+          .event.outcome     = "failure"
+          .event.category    = "authentication"
+          .event.type_id     = "auth_ssh_failed"
+          .event.reason      = if contains(body, "invalid user") { "invalid_user" } else { "bad_credentials" }
+          .auth.method       = m.method
+          .network.transport = "tcp"
+          .matched           = true
+          ._parse_stage      = "specialized"
+        }
+      }
+
+      # ── auth_ssh_invalid_user ──
+      if !.matched && contains(body, "Invalid user") {
+        m, err = parse_regex(body, r'^Invalid user (?P<user>\S+) from (?P<ip>[0-9a-f.:]+)(?:\s+port\s+(?P<port>\d+))?')
+        if err == null {
+          .user.name      = m.user
+          .source.ip      = m.ip
+          .source.port    = to_int(m.port) ?? 0
+          .event.action   = "login"
+          .event.outcome  = "failure"
+          .event.category = "authentication"
+          .event.type_id  = "auth_ssh_invalid_user"
+          .event.reason   = "invalid_user"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ── auth_ssh_auth_failure ──
+      if !.matched && contains(body, "pam_unix(sshd:auth): authentication failure") {
+        m, err = parse_regex(body, r'rhost=(?P<ip>\S+?)(?:\s+user=(?P<user>\S+))?$')
+        if err == null {
+          .source.ip      = m.ip
+          if m.user != "" { .user.name = m.user }
+          .event.action   = "login"
+          .event.outcome  = "failure"
+          .event.category = "authentication"
+          .event.type_id  = "auth_ssh_auth_failure"
+          .event.reason   = "pam_auth_failure"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ── auth_ssh_connection_closed_invalid ──
+      if !.matched && (contains(body, "Connection closed by invalid user") || contains(body, "Connection closed by authenticating user")) {
+        m, err = parse_regex(body, r'^Connection closed by (?:invalid|authenticating) user (?P<user>\S+) (?P<ip>[0-9a-f.:]+) port (?P<port>\d+)')
+        if err == null {
+          .user.name      = m.user
+          .source.ip      = m.ip
+          .source.port    = to_int(m.port) ?? 0
+          .event.action   = "connection_closed"
+          .event.outcome  = "failure"
+          .event.category = "authentication"
+          .event.type_id  = "auth_ssh_connection_closed_invalid"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ══════════════════════ SSH Session Lifecycle ══════════════════════
+
+      # ── auth_ssh_disconnect ──
+      if !.matched && contains(body, "Received disconnect from") {
+        m, err = parse_regex(body, r'^Received disconnect from (?P<ip>[0-9a-f.:]+)(?:\s+port\s+(?P<port>\d+))?:\s*(?P<code>\d+):\s*(?P<reason>.+?)(?:\s+\[(?P<stage>\w+)\])?$')
+        if err == null {
+          .source.ip         = m.ip
+          .source.port       = to_int(m.port) ?? 0
+          .event.action      = "disconnect"
+          .event.type_id     = "auth_ssh_disconnect"
+          .event.reason      = m.reason
+          .network.transport = "tcp"
+          .matched           = true
+          ._parse_stage      = "specialized"
+        }
+      }
+
+      # ── auth_ssh_disconnected ──
+      if !.matched && contains(body, "Disconnected from user") {
+        m, err = parse_regex(body, r'^Disconnected from user (?P<user>\S+) (?P<ip>[0-9a-f.:]+) port (?P<port>\d+)')
+        if err == null {
+          .user.name     = m.user
+          .source.ip     = m.ip
+          .source.port   = to_int(m.port) ?? 0
+          .event.action  = "disconnected"
+          .event.type_id = "auth_ssh_disconnected"
+          .matched       = true
+          ._parse_stage  = "specialized"
+        }
+      }
+
+      # ── auth_ssh_server_listen ──
+      if !.matched && contains(body, "Server listening on") {
+        m, err = parse_regex(body, r'^Server listening on (?P<addr>\S+) port (?P<port>\d+)')
+        if err == null {
+          .server.address  = m.addr
+          .server.port     = to_int(m.port) ?? 0
+          .event.action    = "server_start"
+          .event.category  = "network"
+          .event.type_id   = "auth_ssh_server_listen"
+          .matched         = true
+          ._parse_stage    = "specialized"
+        }
+      }
+
+      # ── auth_ssh_session_opened ──
+      if !.matched && contains(body, "pam_unix(sshd:session): session opened") {
+        m, err = parse_regex(body, r'session opened for user (?P<user>[^\s(]+)\(uid=(?P<uid>\d+)\) by (?P<eff_user>[^\s(]+)\(uid=(?P<eff_uid>\d+)\)')
+        if err == null {
+          .user.name           = m.user
+          .user.id             = m.uid
+          .user.effective.name = m.eff_user
+          .user.effective.id   = m.eff_uid
+          .event.category      = "session"
+          .event.type          = "start"
+          .event.action        = "ssh_session_opened"
+          .event.type_id       = "auth_ssh_session_opened"
+          .matched             = true
+          ._parse_stage        = "specialized"
+        }
+      }
+
+      # ── auth_ssh_session_closed ──
+      if !.matched && contains(body, "pam_unix(sshd:session): session closed") {
+        m, err = parse_regex(body, r'session closed for user (?P<user>\S+)')
+        if err == null {
+          .user.name      = m.user
+          .event.category = "session"
+          .event.type     = "end"
+          .event.action   = "ssh_session_closed"
+          .event.type_id  = "auth_ssh_session_closed"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ══════════════════════ CRON Session ══════════════════════
+
+      # ── auth_cron_session_opened ──
+      if !.matched && contains(body, "pam_unix(cron:session): session opened") {
+        m, err = parse_regex(body, r'session opened for user (?P<user>[^\s(]+)\(uid=(?P<uid>\d+)\) by (?P<eff_user>[^\s(]+)\(uid=(?P<eff_uid>\d+)\)')
+        if err == null {
+          .user.name           = m.user
+          .user.id             = m.uid
+          .user.effective.name = m.eff_user
+          .user.effective.id   = m.eff_uid
+          .event.category      = "session"
+          .event.type          = "start"
+          .event.action        = "cron_session_opened"
+          .event.type_id       = "auth_cron_session_opened"
+          .matched             = true
+          ._parse_stage        = "specialized"
+        }
+      }
+
+      # ── auth_cron_session_closed ──
+      if !.matched && contains(body, "pam_unix(cron:session): session closed") {
+        m, err = parse_regex(body, r'session closed for user (?P<user>\S+)')
+        if err == null {
+          .user.name      = m.user
+          .event.category = "session"
+          .event.type     = "end"
+          .event.action   = "cron_session_closed"
+          .event.type_id  = "auth_cron_session_closed"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ══════════════════════ Sudo / Su ══════════════════════
+
+      # ── auth_sudo_command ──
+      if !.matched && contains(body, "TTY=") && contains(body, "COMMAND=") {
+        m, err = parse_regex(body, r'(?P<user>\S+)\s+:\s+TTY=(?P<tty>\S+)\s+;\s+PWD=(?P<pwd>\S+)\s+;\s+USER=(?P<target_user>\S+)\s+;\s+COMMAND=(?P<cmd>.+)$')
+        if err == null {
+          .user.name            = m.user
+          .user.target.name     = m.target_user
+          .process.command_line = m.cmd
+          .process.working_directory = m.pwd
+          .tty                  = m.tty
+          .event.category       = "process"
+          .event.action         = "sudo_command"
+          .event.type_id        = "auth_sudo_command"
+          .matched              = true
+          ._parse_stage         = "specialized"
+        }
+      }
+
+      # ── auth_sudo_session_opened ──
+      if !.matched && contains(body, "pam_unix(sudo:session): session opened") {
+        m, err = parse_regex(body, r'session opened for user (?P<target>[^\s(]+)\(uid=(?P<target_uid>\d+)\) by (?P<user>[^\s(]+)\(uid=(?P<uid>\d+)\)')
+        if err == null {
+          .user.name        = m.user
+          .user.id          = m.uid
+          .user.target.name = m.target
+          .user.target.id   = m.target_uid
+          .event.category   = "session"
+          .event.type       = "start"
+          .event.action     = "sudo_session_opened"
+          .event.type_id    = "auth_sudo_session_opened"
+          .matched          = true
+          ._parse_stage     = "specialized"
+        }
+      }
+
+      # ── auth_sudo_session_closed ──
+      if !.matched && contains(body, "pam_unix(sudo:session): session closed") {
+        m, err = parse_regex(body, r'session closed for user (?P<target>\S+)')
+        if err == null {
+          .user.target.name = m.target
+          .event.category   = "session"
+          .event.type       = "end"
+          .event.action     = "sudo_session_closed"
+          .event.type_id    = "auth_sudo_session_closed"
+          .matched          = true
+          ._parse_stage     = "specialized"
+        }
+      }
+
+      # ── auth_su_switch ──
+      if !.matched && contains(body, "(to ") && !contains(body, "pam_unix") {
+        m, err = parse_regex(body, r'^\(to (?P<target>\S+)\) (?P<user>\S+) on (?P<tty>\S+)')
+        if err == null {
+          .user.name        = m.user
+          .user.target.name = m.target
+          .tty              = m.tty
+          .event.category   = "authentication"
+          .event.action     = "su_switch"
+          .event.type_id    = "auth_su_switch"
+          .matched          = true
+          ._parse_stage     = "specialized"
+        }
+      }
+
+      # ── auth_su_session_opened ──
+      if !.matched && contains(body, "pam_unix(su:session): session opened") {
+        m, err = parse_regex(body, r'session opened for user (?P<target>[^\s(]+)\(uid=(?P<target_uid>\d+)\) by (?P<user>[^\s(]+)\(uid=(?P<uid>\d+)\)')
+        if err == null {
+          .user.name        = m.user
+          .user.id          = m.uid
+          .user.target.name = m.target
+          .user.target.id   = m.target_uid
+          .event.category   = "session"
+          .event.type       = "start"
+          .event.action     = "su_session_opened"
+          .event.type_id    = "auth_su_session_opened"
+          .matched          = true
+          ._parse_stage     = "specialized"
+        }
+      }
+
+      # ── auth_su_session_closed ──
+      if !.matched && contains(body, "pam_unix(su:session): session closed") {
+        m, err = parse_regex(body, r'session closed for user (?P<target>\S+)')
+        if err == null {
+          .user.target.name = m.target
+          .event.category   = "session"
+          .event.type       = "end"
+          .event.action     = "su_session_closed"
+          .event.type_id    = "auth_su_session_closed"
+          .matched          = true
+          ._parse_stage     = "specialized"
+        }
+      }
+
+      # ══════════════════════ systemd-logind ══════════════════════
+
+      # ── auth_logind_new_session ──
+      if !.matched && contains(body, "New session") {
+        m, err = parse_regex(body, r'^New session (?P<session_id>\S+) of user (?P<user>\S+)\.')
+        if err == null {
+          .user.name      = m.user
+          .session.id     = m.session_id
+          .event.category = "session"
+          .event.type     = "start"
+          .event.action   = "logind_new_session"
+          .event.type_id  = "auth_logind_new_session"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ── auth_logind_session_logout ──
+      if !.matched && contains(body, "logged out. Waiting for processes to exit") {
+        m, err = parse_regex(body, r'^Session (?P<session_id>\S+) logged out')
+        if err == null {
+          .session.id     = m.session_id
+          .event.category = "session"
+          .event.type     = "end"
+          .event.action   = "logind_session_logout"
+          .event.type_id  = "auth_logind_session_logout"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ── auth_logind_removed_session ──
+      if !.matched && contains(body, "Removed session") {
+        m, err = parse_regex(body, r'^Removed session (?P<session_id>\S+)\.')
+        if err == null {
+          .session.id    = m.session_id
+          .event.action  = "logind_removed_session"
+          .event.type_id = "auth_logind_removed_session"
+          .matched       = true
+          ._parse_stage  = "specialized"
+        }
+      }
+
+      # ══════════════════════ systemd-user ══════════════════════
+
+      # ── auth_systemd_user_session_opened ──
+      if !.matched && contains(body, "pam_unix(systemd-user:session): session opened") {
+        m, err = parse_regex(body, r'session opened for user (?P<user>[^\s(]+)\(uid=(?P<uid>\d+)\) by (?P<eff_user>[^\s(]+)\(uid=(?P<eff_uid>\d+)\)')
+        if err == null {
+          .user.name           = m.user
+          .user.id             = m.uid
+          .user.effective.name = m.eff_user
+          .user.effective.id   = m.eff_uid
+          .event.category      = "session"
+          .event.type          = "start"
+          .event.action        = "systemd_user_session_opened"
+          .event.type_id       = "auth_systemd_user_session_opened"
+          .matched             = true
+          ._parse_stage        = "specialized"
+        }
+      }
+
+      # ── auth_systemd_user_session_closed ──
+      if !.matched && contains(body, "pam_unix(systemd-user:session): session closed") {
+        m, err = parse_regex(body, r'session closed for user (?P<user>\S+)')
+        if err == null {
+          .user.name      = m.user
+          .event.category = "session"
+          .event.type     = "end"
+          .event.action   = "systemd_user_session_closed"
+          .event.type_id  = "auth_systemd_user_session_closed"
+          .matched        = true
+          ._parse_stage   = "specialized"
+        }
+      }
+
+      # ══════════════════════ login session ══════════════════════
+
+      # ── auth_login_session_opened ──
+      if !.matched && contains(body, "pam_unix(login:session): session opened") {
+        m, err = parse_regex(body, r'session opened for user (?P<user>[^\s(]+)\(uid=(?P<uid>\d+)\) by (?P<eff_user>[^\s(]+)\(uid=(?P<eff_uid>\d+)\)')
+        if err == null {
+          .user.name           = m.user
+          .user.id             = m.uid
+          .user.effective.name = m.eff_user
+          .user.effective.id   = m.eff_uid
+          .event.category      = "session"
+          .event.type          = "start"
+          .event.action        = "login_session_opened"
+          .event.type_id       = "auth_login_session_opened"
+          .matched             = true
+          ._parse_stage        = "specialized"
+        }
+      }
+
+      # ══════════════════════ System / Boot ══════════════════════
+
+      # ── auth_logind_new_seat ──
+      if !.matched && contains(body, "New seat") {
+        .event.category = "host"
+        .event.action   = "new_seat"
+        .event.type_id  = "auth_logind_new_seat"
+        .matched        = true
+        ._parse_stage   = "specialized"
+      }
+
+      # ── auth_logind_watching_buttons ──
+      if !.matched && contains(body, "Watching system buttons") {
+        .event.category = "host"
+        .event.action   = "watching_buttons"
+        .event.type_id  = "auth_logind_watching_buttons"
+        .matched        = true
+        ._parse_stage   = "specialized"
+      }
+
+      # ── auth_polkitd ──
+      if !.matched && contains(body, "polkitd") || (!.matched && proc == "polkitd") {
+        .event.category = "host"
+        .event.action   = "polkitd"
+        .event.type_id  = "auth_polkitd"
+        .matched        = true
+        ._parse_stage   = "specialized"
+      }
+
+      # ── auth_pam_module_error ──
+      if !.matched && (contains(body, "PAM unable to dlopen") || contains(body, "PAM adding faulty module")) {
+        .event.category = "host"
+        .event.action   = "pam_module_error"
+        .event.outcome  = "failure"
+        .event.type_id  = "auth_pam_module_error"
+        .matched        = true
+        ._parse_stage   = "specialized"
+      }
+
+      # ── auth_pam_check_pass (unknown user) ──
+      if !.matched && contains(body, "check pass; user unknown") {
+        .event.category = "authentication"
+        .event.action   = "check_pass_unknown"
+        .event.outcome  = "failure"
+        .event.type_id  = "auth_pam_check_pass"
+        .matched        = true
+        ._parse_stage   = "specialized"
+      }
+
+      # ══════════════════════ Generic Fallback ══════════════════════
+
+      if !.matched {
+        .message       = body
+        .event.type_id = "auth_generic"
+        ._parse_stage  = "generic"
+        .tags          = push(array!(.tags), "unparsed")
+      }
+
+      # ── Shared final fields ──
+      .event.dataset = "auth"
+      .event.created = .@timestamp
+      .event.kind    = "event"
+      .@version      = "1"
+
+      del(._body)
+      del(._parsed_header)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFORM — Stage 3: Severity enrichment
+# ─────────────────────────────────────────────────────────────────────────────
+  enrich_severity:
+    type: remap
+    inputs:
+      - parse_auth_body
+    source: |
+      tid = string!(.event.type_id)
+
+      if tid == "auth_ssh_failed" || tid == "auth_ssh_invalid_user" || tid == "auth_ssh_auth_failure" || tid == "auth_ssh_connection_closed_invalid" {
+        .event.severity = 4
+      } else if tid == "auth_ssh_success" {
+        .event.severity = 2
+      } else if tid == "auth_sudo_command" || tid == "auth_su_switch" {
+        .event.severity = 3
+      } else if tid == "auth_pam_module_error" {
+        .event.severity = 5
+      } else {
+        .event.severity = 1
+      }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SINK — Newline-delimited JSON
+# ─────────────────────────────────────────────────────────────────────────────
+sinks:
+  to_file:
+    type: file
+    inputs:
+      - enrich_severity
+    path: /home/shabh/RustLogger/auth_vec_out.json
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    buffer:
+      type: memory
+      max_events: 10000
+      when_full: block

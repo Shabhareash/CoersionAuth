@@ -58,21 +58,23 @@ impl LogType {
         }
     }
 
-    pub fn top_pattern(&self) -> &'static str {
+    /// Returns an ordered list of grok patterns to try.
+    /// The first match wins; the last entry is always a GREEDYDATA fallback.
+    pub fn top_patterns(&self) -> &'static [&'static str] {
         match self {
-            LogType::Systemd    => "SYSLOGLINE",
-            LogType::Syslog     => "SYSLOGLINE",
-            LogType::Auth       => "SYSLOGLINE",
-            LogType::Kernel     => "SYSLOGLINE",
-            LogType::Firewall   => "SYSLOGLINE",
-            LogType::Dhcp       => "SYSLOGLINE",
-            LogType::Apache     => "HTTPD_COMBINEDLOG",
-            LogType::Mongodb    => "MONGO3_LOG",
-            LogType::Redis      => "REDISLOG",
-            LogType::Postgresql => "POSTGRESQL",
-            LogType::Zeek       => "ZEEK_HTTP",
-            LogType::ZeekDhcp   => "ZEEK_DHCP",
-            LogType::Unknown    => "GREEDYDATA",
+            LogType::Systemd    => &["SYSLOGLINE", "SYSLOGBASE", "GREEDYDATA"],
+            LogType::Syslog     => &["SYSLOGLINE", "SYSLOGBASE", "GREEDYDATA"],
+            LogType::Auth       => &["SYSLOGLINE", "SYSLOGBASE", "GREEDYDATA"],
+            LogType::Kernel     => &["SYSLOGLINE", "SYSLOGBASE", "GREEDYDATA"],
+            LogType::Firewall   => &["SYSLOGLINE", "SYSLOGBASE", "GREEDYDATA"],
+            LogType::Dhcp       => &["SYSLOGLINE", "SYSLOGBASE", "GREEDYDATA"],
+            LogType::Apache     => &["HTTPD_COMBINEDLOG", "HTTPD_COMMONLOG", "GREEDYDATA"],
+            LogType::Mongodb    => &["MONGO3_LOG", "GREEDYDATA"],
+            LogType::Redis      => &["REDISLOG", "GREEDYDATA"],
+            LogType::Postgresql => &["POSTGRESQL", "GREEDYDATA"],
+            LogType::Zeek       => &["ZEEK_HTTP", "GREEDYDATA"],
+            LogType::ZeekDhcp   => &["ZEEK_DHCP", "GREEDYDATA"],
+            LogType::Unknown    => &["GREEDYDATA"],
         }
     }
 }
@@ -210,22 +212,41 @@ fn load_pattern_file(grok: &mut Grok, path: &Path) {
     println!("[INIT] Loaded: {}", path.display());
 }
 
-// ─── Build Grok Compiler ──────────────────────────────────────────────────────
+// ─── Build Grok Compiler (Multi-Pattern) ──────────────────────────────────────
 
-pub fn build_grok_for_type(log_type: LogType, patterns_root: &str) -> (Grok, grok::Pattern) {
+/// Compiles all candidate patterns for the detected log type.
+/// Returns a Vec of compiled patterns in priority order — the caller should
+/// try them in sequence and use the first match (Logstash-style multi-pattern).
+pub fn build_grok_for_type(log_type: LogType, patterns_root: &str) -> (Grok, Vec<grok::Pattern>) {
     let mut grok = Grok::default();
     let root = Path::new(patterns_root);
     for &fname in log_type.pattern_files() {
         load_pattern_file(&mut grok, &root.join(fname));
     }
-    let top     = log_type.top_pattern();
-    let pat_str = format!("%{{{}}}", top);
-    let pattern = grok
-        .compile(&pat_str, false)
-        .or_else(|e| {
-            eprintln!("[WARN] Could not compile '{}': {}. Falling back to GREEDYDATA.", top, e);
+
+    let mut compiled: Vec<grok::Pattern> = Vec::new();
+
+    for &top in log_type.top_patterns() {
+        let pat_str = format!("%{{{}}}", top);
+        match grok.compile(&pat_str, false) {
+            Ok(pattern) => {
+                println!("[INIT] Compiled pattern: {}", top);
+                compiled.push(pattern);
+            }
+            Err(e) => {
+                eprintln!("[WARN] Could not compile '{}': {} — skipping.", top, e);
+            }
+        }
+    }
+
+    // Safety net: if every named pattern failed, compile a raw GREEDYDATA
+    if compiled.is_empty() {
+        eprintln!("[WARN] All patterns failed for {:?}. Using GREEDYDATA catch-all.", log_type);
+        compiled.push(
             grok.compile("%{GREEDYDATA:raw_line}", false)
-        })
-        .expect("Even GREEDYDATA fallback failed — grok is broken.");
-    (grok, pattern)
+                .expect("GREEDYDATA must compile — grok is fundamentally broken")
+        );
+    }
+
+    (grok, compiled)
 }

@@ -1,0 +1,287 @@
+version: 1
+
+log_family: ssh
+
+pipeline:
+  classifier:
+    strategy: aho_corasick
+    fallback: generic_parser
+
+  signatures:
+    - id: ssh_success
+      contains:
+        - "Accepted password for"
+        - "Accepted publickey for"
+
+    - id: ssh_failed
+      contains:
+        - "Failed password for"
+        - "Failed publickey for"
+
+    - id: ssh_invalid_user
+      contains:
+        - "Invalid user"
+        - "Illegal user"
+
+    - id: ssh_disconnect
+      contains:
+        - "Received disconnect"
+
+    - id: ssh_connection_closed
+      contains:
+        - "Connection closed"
+
+    - id: ssh_session_opened
+      contains:
+        - "session opened for user"
+
+    - id: ssh_session_closed
+      contains:
+        - "session closed for user"
+
+    - id: ssh_pam_auth_failure
+      contains:
+        - "pam_unix(sshd:auth): authentication failure"
+
+    - id: ssh_reverse_dns_failure
+      contains:
+        - "POSSIBLE BREAK-IN ATTEMPT"
+
+    - id: ssh_connection_reset
+      contains:
+        - "Connection reset by"
+
+    - id: ssh_no_identification
+      contains:
+        - "Did not receive identification string"
+
+    - id: ssh_protocol_violation
+      contains:
+        - "Bad protocol version identification"
+
+    - id: ssh_max_auth_attempts
+      contains:
+        - "maximum authentication attempts exceeded"
+
+    - id: ssh_negotiation_failure
+      contains:
+        - "Unable to negotiate"
+
+    - id: ssh_banner_exchange
+      contains:
+        - "banner exchange"
+
+  specialized_parsers:
+
+    ssh_success:
+      strategy: dissect
+      patterns:
+        - "Accepted %{?method} for %{user.name:notspace} from %{source.ip:ip} port %{source.port:int}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: authentication
+          event.action: login
+          event.outcome: success
+          event.type_id: ssh_success
+
+    ssh_failed:
+      strategy: dissect
+      patterns:
+        # Most specific first: "Failed password for invalid user X from ..."
+        # %{?prefix} swallows "invalid user " / "illegal user " / nothing
+        - "Failed %{?method} for %{?prefix}%{user.name:notspace} from %{source.ip:ip} port %{source.port:int} %{?proto}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.type_id: ssh_failed
+
+    ssh_invalid_user:
+      strategy: dissect
+      patterns:
+        # Handles: Invalid/Illegal/Unknown user X from Y
+        - "%{?adjective} user %{user.name:notspace} from %{source.ip:ip}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.reason: invalid_user
+          event.type_id: ssh_invalid_user
+
+    ssh_disconnect:
+      strategy: dissect
+      patterns:
+        - "Received disconnect from %{source.ip:ip} port %{source.port:int}:%{?reason}"
+        - "Received disconnect from %{source.ip:ip}:%{?reason}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.action: disconnect
+          event.type_id: ssh_disconnect
+
+    ssh_connection_closed:
+      strategy: dissect
+      patterns:
+        - "Connection closed by %{?prefix}%{source.ip:ip} port %{source.port:int}"
+        - "Connection closed by %{?prefix}%{source.ip:ip}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.action: connection_closed
+          event.type_id: ssh_connection_closed
+
+    ssh_session_opened:
+      strategy: dissect
+      patterns:
+        - "session opened for user %{user.name:notspace}(%{?rest}"
+        - "session opened for user %{user.name:notspace}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: session
+          event.type: start
+          event.type_id: ssh_session_opened
+
+    ssh_session_closed:
+      strategy: dissect
+      patterns:
+        - "session closed for user %{user.name:notspace}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: session
+          event.type: end
+          event.type_id: ssh_session_closed
+
+    ssh_pam_auth_failure:
+      strategy: dissect
+      patterns:
+        - "%{?head}rhost=%{source.ip:notspace} %{?mid}user=%{user.name:notspace}"
+        - "%{?head}rhost=%{source.ip:notspace}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.reason: pam_auth_failure
+          event.type_id: ssh_pam_auth_failure
+
+    ssh_reverse_dns_failure:
+      strategy: dissect
+      patterns:
+        - "%{?head}[%{source.ip:ip}]%{?tail}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: network
+          event.action: reverse_dns_lookup
+          event.outcome: failure
+          event.type_id: ssh_reverse_dns_failure
+          threat.indicator: true
+          threat.type: network
+
+    ssh_connection_reset:
+      strategy: dissect
+      patterns:
+        - "Connection reset by %{source.ip:ip} port %{source.port:int}"
+        - "Connection reset by %{source.ip:ip}"
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: network
+          event.action: connection_reset
+          event.type_id: ssh_connection_reset
+
+    ssh_no_identification:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: network
+          event.action: identification_failure
+          event.type_id: ssh_no_identification
+
+    ssh_protocol_violation:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: network
+          event.action: protocol_violation
+          event.outcome: failure
+          event.type_id: ssh_protocol_violation
+
+    ssh_max_auth_attempts:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.reason: max_auth_attempts
+          event.type_id: ssh_max_auth_attempts
+
+    ssh_negotiation_failure:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: network
+          event.action: negotiation_failure
+          event.outcome: failure
+          event.type_id: ssh_negotiation_failure
+
+    ssh_banner_exchange:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: ssh
+          event.category: network
+          event.action: banner_exchange
+          event.type_id: ssh_banner_exchange
+
+  generic_parser:
+    enabled: true
+    strategy: regex
+
+    patterns:
+      - name: generic_sshd
+        regex: 'sshd\[(?P<pid>\d+)\]: (?P<message>.*)'
+
+        ecs:
+          pid: process.pid
+          message: message
+
+  raw_ingestion:
+    enabled: true
+    preserve_original: true
+
+    fields:
+      - event.original
+      - message
+      - host.name
+      - process.name
+      - process.pid
+
+syslog:
+  bsd_format:
+    timestamp_fields: 3
+    hostname_offset: 3
+    process_offset: 4
+
+  iso_format:
+    timestamp_fields: 1
+    hostname_offset: 1
+    process_offset: 2
