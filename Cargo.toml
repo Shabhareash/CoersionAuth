@@ -42,7 +42,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
+debug = true
+strip = false
 
 [[bin]]
 name = "kafka_pipeline"

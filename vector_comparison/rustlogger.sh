@@ -1,43 +1,51 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════
-#  Vector Daemon — Steady-State Performance Benchmark
+#  RustLogger Daemon — Steady-State Performance Benchmark
 # ═══════════════════════════════════════════════════════════════════════
-#  Starts Vector as a daemon, feeds continuous Kafka load, scrapes
-#  its blackhole sink output every second for a configurable
-#  measurement window, then prints a full report.
+#  Starts 3 daemon instances (one per partition), feeds continuous
+#  Kafka load, scrapes the HTTP /metrics endpoints every second for
+#  a configurable measurement window, then prints a full report.
 #
-#  Usage:  ./vector.sh [DURATION_SECS]    (default: 30)
+#  Usage:  ./rustlogger.sh [DURATION_SECS]    (default: 30)
 # ═══════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 DURATION=${1:-30}
 INPUT_LOG="auth_1m.log"
-VECTOR_CFG="/home/shabh/.vector/config/vector.yaml"
-VECTOR_BIN="/home/shabh/.vector/bin/vector"
+RUST_YAML="auth.yaml"
 KAFKA_TOPIC="raw-logs"
+BASE_METRICS_PORT=9093   # ports 9093, 9094, 9095 for the 3 consumers
+
+export RAYON_NUM_THREADS=2
+export TOKIO_WORKER_THREADS=2
 
 SUDO_CMD="sudo"
-LOG_DIR="/tmp/vector_daemon_$$"
+LOG_DIR="/mnt/win_ssd/rustlogger_daemon_$$"
 mkdir -p "$LOG_DIR"
-VECTOR_LOG="${LOG_DIR}/vector.log"
 
 cleanup() {
     echo
-    echo "[CLEANUP] Stopping load generator and Vector..."
+    echo "[CLEANUP] Stopping load generator and daemons..."
     kill "${PRODUCER_PID:-}" 2>/dev/null || true
-    kill "${VECTOR_PID:-}" 2>/dev/null || true
+    for pid in "${DAEMON_PIDS[@]:-}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    # Give them a moment to flush
     sleep 1
-    kill -9 "${VECTOR_PID:-}" 2>/dev/null || true
+    for pid in "${DAEMON_PIDS[@]:-}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
     rm -rf "$LOG_DIR"
 }
 trap cleanup EXIT
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║            Vector Daemon Steady-State Benchmark              ║"
+echo "║         RustLogger Daemon Steady-State Benchmark             ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  Measurement Window : ${DURATION}s                                    ║"
 echo "║  Input Log          : ${INPUT_LOG}                            ║"
-echo "║  Vector Config      : vector.yaml (VRL + blackhole)          ║"
+echo "║  Partitions         : 3                                      ║"
+echo "║  Metrics Ports      : 9093, 9094, 9095                       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo
 
@@ -64,28 +72,43 @@ $SUDO_CMD docker exec kafka-bench \
     --config segment.bytes=52428800 \
     2>/dev/null || true
 
-# ── 3. Clean Vector state and start daemon ────────────────────────────
-echo "[DAEMON] Cleaning Vector state..."
-$SUDO_CMD rm -rf /var/lib/vector/* 2>/dev/null || true
+# ── 3. Start 3 RustLogger daemon instances ───────────────────────────
+echo "[DAEMON] Starting 3 RustLogger daemon consumers..."
+DAEMON_PIDS=()
 
-echo "[DAEMON] Starting Vector..."
-$VECTOR_BIN --config "$VECTOR_CFG" >"$VECTOR_LOG" 2>&1 &
-VECTOR_PID=$!
-disown $VECTOR_PID
+for id in 0 1 2; do
+    port=$((BASE_METRICS_PORT + id))
+    DAEMON=1 \
+    METRICS_PORT=$port \
+    KAFKA_BROKER="localhost:9092" \
+    KAFKA_TOPIC="$KAFKA_TOPIC" \
+    KAFKA_GROUP="rustlogger-daemon" \
+    KAFKA_PARTITION="$id" \
+    WRITE_TO_STDOUT=1 \
+        ./target/release/kafka_pipeline "$RUST_YAML" \
+        > /dev/null \
+        2> "${LOG_DIR}/consumer_${id}.log" &
+    pid=$!
+    DAEMON_PIDS+=($pid)
+    disown $pid
+    echo "  → Consumer $id (partition $id) started on PID $pid, metrics at :$port"
+done
 
-# Wait for Vector to start
+# Wait for HTTP servers to be ready
+echo "[DAEMON] Waiting for metrics endpoints..."
 sleep 3
 
-if ! kill -0 $VECTOR_PID 2>/dev/null; then
-    echo "[ERROR] Vector failed to start. Log:"
-    cat "$VECTOR_LOG"
-    exit 1
-fi
-echo "[DAEMON] Vector running on PID $VECTOR_PID"
+for port in $BASE_METRICS_PORT $((BASE_METRICS_PORT+1)) $((BASE_METRICS_PORT+2)); do
+    for attempt in $(seq 1 10); do
+        if curl -s --connect-timeout 1 "http://localhost:${port}/metrics" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+done
+echo "[DAEMON] All 3 consumers running."
 
 # ── 4. Start continuous load generator ────────────────────────────────
-# Uses the same native Rust rdkafka producer as rustlogger.sh for a fair
-# apples-to-apples comparison (no shell pipe / JVM bottleneck).
 echo "[LOAD] Starting continuous native Rust Kafka producer (looping $INPUT_LOG)..."
 (
     while true; do
@@ -102,45 +125,58 @@ sleep 10
 # ── 6. Measurement phase ─────────────────────────────────────────────
 echo "[MEASURE] Collecting metrics every 1s for ${DURATION}s..."
 
-# Parse the latest event count from Vector's blackhole log output.
-# Vector logs lines like:
-#   ... INFO vector::sinks::blackhole::sink: Collected events. events=12345 raw_bytes_collected=...
-get_vector_total() {
-    # Get the last blackhole log line and extract the events count
-    grep "Collected events" "$VECTOR_LOG" 2>/dev/null | tail -1 | \
-        sed -n 's/.*events=\([0-9]*\).*/\1/p' || echo 0
-}
+# Snapshot the starting totals from all 3 consumers
+start_total=0
+for port in $BASE_METRICS_PORT $((BASE_METRICS_PORT+1)) $((BASE_METRICS_PORT+2)); do
+    val=$(curl -s "http://localhost:${port}/metrics" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['total_consumed'])" 2>/dev/null || echo 0)
+    start_total=$((start_total + val))
+done
 
-# Snapshot starting total
-start_total=$(get_vector_total)
-
+# Collect per-second CPU/memory snapshots
 SAMPLES_FILE="${LOG_DIR}/samples.csv"
 echo "second,total_consumed,cpu_pct,rss_kb" > "$SAMPLES_FILE"
 
 for sec in $(seq 1 $DURATION); do
     sleep 1
 
-    combined_total=$(get_vector_total)
+    # Query metrics from all 3 endpoints
+    combined_total=0
+    for port in $BASE_METRICS_PORT $((BASE_METRICS_PORT+1)) $((BASE_METRICS_PORT+2)); do
+        val=$(curl -s --connect-timeout 1 "http://localhost:${port}/metrics" 2>/dev/null | \
+              python3 -c "import sys,json; print(json.load(sys.stdin)['total_consumed'])" 2>/dev/null || echo 0)
+        combined_total=$((combined_total + val))
+    done
 
-    # Get CPU% and RSS for Vector process
-    cpu_mem=$(ps -p $VECTOR_PID -o %cpu=,rsz= --no-headers 2>/dev/null | \
-        awk '{printf "%.1f,%d", $1, $2}' 2>/dev/null || echo "0.0,0")
+    # Get CPU% and RSS for all kafka_pipeline processes
+    cpu_mem=$(ps -C kafka_pipeline -o %cpu=,rsz= --no-headers 2>/dev/null | \
+        awk '{cpu+=$1; rss+=$2} END {printf "%.1f,%d", cpu, rss}' 2>/dev/null || echo "0.0,0")
 
     cpu_pct=$(echo "$cpu_mem" | cut -d, -f1)
     rss_kb=$(echo "$cpu_mem" | cut -d, -f2)
 
     echo "${sec},${combined_total},${cpu_pct},${rss_kb}" >> "$SAMPLES_FILE"
-    printf "\r  [%3d/%ds] Total: %s events | CPU: %s%% | RSS: %d KB" \
+    printf "\r  [%3d/%ds] Total: %d events | CPU: %s%% | RSS: %d KB" \
         "$sec" "$DURATION" "$combined_total" "$cpu_pct" "$rss_kb"
 done
 
 echo  # newline after progress
 
-# Snapshot ending total
-end_total=$(get_vector_total)
+# Snapshot the ending totals
+end_total=0
+for port in $BASE_METRICS_PORT $((BASE_METRICS_PORT+1)) $((BASE_METRICS_PORT+2)); do
+    val=$(curl -s "http://localhost:${port}/metrics" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['total_consumed'])" 2>/dev/null || echo 0)
+    end_total=$((end_total + val))
+done
+
+# Get peak EPS from all consumers
+peak_eps=0
+for port in $BASE_METRICS_PORT $((BASE_METRICS_PORT+1)) $((BASE_METRICS_PORT+2)); do
+    val=$(curl -s "http://localhost:${port}/metrics" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['peak_eps'])" 2>/dev/null || echo 0)
+    peak_eps=$((peak_eps + val))
+done
 
 # ── 7. Compute final stats ────────────────────────────────────────────
-RESULTS=$(python3 - <<EOF
+python3 - <<EOF
 import csv
 
 samples = []
@@ -161,7 +197,6 @@ duration = ${DURATION}
 events_during_window = end_total - start_total
 steady_eps = int(events_during_window / duration) if duration > 0 else 0
 
-# Per-second EPS from deltas
 eps_list = []
 for i in range(1, len(samples)):
     delta = samples[i]["total"] - samples[i-1]["total"]
@@ -175,27 +210,31 @@ min_sec_eps = min(eps_list) if eps_list else 0
 avg_cpu = sum(s["cpu"] for s in samples) / len(samples) if samples else 0
 avg_rss_mb = (sum(s["rss"] for s in samples) / len(samples)) / 1024 if samples else 0
 peak_rss_mb = max(s["rss"] for s in samples) / 1024 if samples else 0
+combined_peak = ${peak_eps}
 
-print(f"{events_during_window},{steady_eps},{avg_eps},{peak_sec_eps},{min_sec_eps},{avg_cpu:.1f},{avg_rss_mb:.1f},{peak_rss_mb:.1f}")
+cpu_eff = int(steady_eps / (avg_cpu / 100)) if avg_cpu > 0 else 0
+
+WIDTH = 62
+print()
+print("╔" + "═" * WIDTH + "╗")
+print(f"║{'RUSTLOGGER STEADY-STATE RESULTS':^{WIDTH}}║")
+print("╠" + "═" * WIDTH + "╣")
+
+def row(label, val):
+    print(f"║  {label:<19} : {str(val):<38}║")
+
+row("Measurement Window", f"{duration}s")
+row("Events Processed", f"{events_during_window:,}")
+row("Steady-State EPS", f"{steady_eps:,} events/sec")
+row("Avg Per-Second EPS", f"{avg_eps:,} events/sec")
+row("Peak Per-Second EPS", f"{peak_sec_eps:,} events/sec")
+row("Min Per-Second EPS", f"{min_sec_eps:,} events/sec")
+row("Combined Peak EPS", f"{combined_peak:,} events/sec")
+print("╠" + "═" * WIDTH + "╣")
+row("Avg CPU (3 procs)", f"{avg_cpu:.1f}%")
+row("Avg RSS (3 procs)", f"{avg_rss_mb:.1f} MB")
+row("Peak RSS", f"{peak_rss_mb:.1f} MB")
+row("CPU Efficiency", f"{cpu_eff:,} EPS/core")
+print("╚" + "═" * WIDTH + "╝")
+print()
 EOF
-)
-
-IFS=',' read -r EVENTS STEADY_EPS AVG_EPS PEAK_SEC MIN_SEC AVG_CPU AVG_RSS PEAK_RSS <<< "$RESULTS"
-
-echo
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║              VECTOR STEADY-STATE RESULTS                     ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  Measurement Window  : $(printf "%-37s" "${DURATION}s") ║"
-echo "║  Events Processed    : $(printf "%-37s" "${EVENTS}") ║"
-echo "║  Steady-State EPS    : $(printf "%-37s" "${STEADY_EPS} events/sec") ║"
-echo "║  Avg Per-Second EPS  : $(printf "%-37s" "${AVG_EPS} events/sec") ║"
-echo "║  Peak Per-Second EPS : $(printf "%-37s" "${PEAK_SEC} events/sec") ║"
-echo "║  Min  Per-Second EPS : $(printf "%-37s" "${MIN_SEC} events/sec") ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  Avg CPU (1 proc)    : $(printf "%-37s" "${AVG_CPU}%") ║"
-echo "║  Avg RSS             : $(printf "%-37s" "${AVG_RSS} MB") ║"
-echo "║  Peak RSS            : $(printf "%-37s" "${PEAK_RSS} MB") ║"
-echo "║  CPU Efficiency      : $(printf "%-37s" "$(python3 -c "print(f'{int(${STEADY_EPS}/(${AVG_CPU}/100)) if float(\"${AVG_CPU}\") > 0 else 0} EPS/core')")") ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
-echo

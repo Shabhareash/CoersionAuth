@@ -1,0 +1,521 @@
+version: 1
+
+log_family: auth
+
+pipeline:
+  classifier:
+    strategy: aho_corasick
+    fallback: generic_parser
+
+  signatures:
+    # --- SSH Authentication ---
+    - id: auth_ssh_success
+      contains:
+        - "Accepted password for"
+        - "Accepted publickey for"
+
+    - id: auth_ssh_failed
+      contains:
+        - "Failed password for"
+        - "Failed publickey for"
+
+    - id: auth_ssh_invalid_user
+      contains:
+        - "Invalid user"
+
+    - id: auth_ssh_auth_failure
+      contains:
+        - "pam_unix(sshd:auth): authentication failure"
+
+    - id: auth_ssh_connection_closed_invalid
+      contains:
+        - "Connection closed by invalid user"
+        - "Connection closed by authenticating user"
+
+    # --- SSH Session Lifecycle ---
+    - id: auth_ssh_session_opened
+      contains:
+        - "pam_unix(sshd:session): session opened"
+
+    - id: auth_ssh_session_closed
+      contains:
+        - "pam_unix(sshd:session): session closed"
+
+    - id: auth_ssh_disconnect
+      contains:
+        - "Received disconnect from"
+
+    - id: auth_ssh_disconnected
+      contains:
+        - "Disconnected from user"
+
+    - id: auth_ssh_server_listen
+      contains:
+        - "Server listening on"
+
+    # --- CRON Session ---
+    - id: auth_cron_session_opened
+      contains:
+        - "pam_unix(cron:session): session opened"
+
+    - id: auth_cron_session_closed
+      contains:
+        - "pam_unix(cron:session): session closed"
+
+    # --- Sudo / Su ---
+    - id: auth_sudo_command
+      contains:
+        - "sudo:"
+        - "TTY="
+
+    - id: auth_sudo_session_opened
+      contains:
+        - "pam_unix(sudo:session): session opened"
+
+    - id: auth_sudo_session_closed
+      contains:
+        - "pam_unix(sudo:session): session closed"
+
+    - id: auth_su_switch
+      contains:
+        - "(to root)"
+
+    - id: auth_su_session_opened
+      contains:
+        - "pam_unix(su:session): session opened"
+
+    - id: auth_su_session_closed
+      contains:
+        - "pam_unix(su:session): session closed"
+
+    # --- systemd-logind ---
+    - id: auth_logind_new_session
+      contains:
+        - "New session"
+
+    - id: auth_logind_session_logout
+      contains:
+        - "logged out. Waiting for processes to exit"
+
+    - id: auth_logind_removed_session
+      contains:
+        - "Removed session"
+
+    # --- systemd-user ---
+    - id: auth_systemd_user_session_opened
+      contains:
+        - "pam_unix(systemd-user:session): session opened"
+
+    - id: auth_systemd_user_session_closed
+      contains:
+        - "pam_unix(systemd-user:session): session closed"
+
+    # --- login session ---
+    - id: auth_login_session_opened
+      contains:
+        - "pam_unix(login:session): session opened"
+
+    # --- System boot / polkitd / seat ---
+    - id: auth_logind_new_seat
+      contains:
+        - "New seat"
+
+    - id: auth_polkitd
+      contains:
+        - "polkitd"
+
+    - id: auth_pam_module_error
+      contains:
+        - "PAM unable to dlopen"
+        - "PAM adding faulty module"
+
+  specialized_parsers:
+
+    # =================== SSH Authentication ===================
+
+    auth_ssh_success:
+      strategy: dissect
+      patterns:
+        # Accepted password for fusion from 10.8.0.46 port 49209 ssh2
+        - "Accepted %{?method} for %{user.name:notspace} from %{source.ip:ip} port %{source.port:int} %{?proto}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: authentication
+          event.action: login
+          event.outcome: success
+          event.type_id: auth_ssh_success
+
+    auth_ssh_failed:
+      strategy: dissect
+      patterns:
+        # Failed password for invalid user sumersoc from 10.8.0.38 port 45088 ssh2
+        - "Failed %{?method} for invalid user %{user.name:notspace} from %{source.ip:ip} port %{source.port:int} %{?proto}"
+        # Failed password for fusion from 10.8.0.58 port 59770 ssh2
+        - "Failed %{?method} for %{user.name:notspace} from %{source.ip:ip} port %{source.port:int} %{?proto}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.type_id: auth_ssh_failed
+
+    auth_ssh_invalid_user:
+      strategy: dissect
+      patterns:
+        # Invalid user sanket from 10.8.0.10 port 35758
+        - "Invalid user %{user.name:notspace} from %{source.ip:ip} port %{source.port:int}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.reason: invalid_user
+          event.type_id: auth_ssh_invalid_user
+
+    auth_ssh_auth_failure:
+      strategy: dissect
+      patterns:
+        # pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=10.8.0.58  user=fusion
+        - "%{?head}rhost=%{source.ip:notspace}  user=%{user.name:notspace}"
+        - "%{?head}rhost=%{source.ip:notspace} user=%{user.name:notspace}"
+        # rhost-only (no user field, e.g. unknown user)
+        - "%{?head}rhost=%{source.ip:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: authentication
+          event.action: login
+          event.outcome: failure
+          event.reason: pam_auth_failure
+          event.type_id: auth_ssh_auth_failure
+
+    auth_ssh_connection_closed_invalid:
+      strategy: dissect
+      patterns:
+        # Connection closed by invalid user sanket 10.8.0.10 port 35758 [preauth]
+        - "Connection closed by invalid user %{user.name:notspace} %{source.ip:ip} port %{source.port:int}%{?rest}"
+        # Connection closed by authenticating user fusion 10.8.0.10 port 60014 [preauth]
+        - "Connection closed by authenticating user %{user.name:notspace} %{source.ip:ip} port %{source.port:int}%{?rest}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: authentication
+          event.action: connection_closed
+          event.outcome: failure
+          event.type_id: auth_ssh_connection_closed_invalid
+
+    # =================== SSH Session Lifecycle ===================
+
+    auth_ssh_session_opened:
+      strategy: dissect
+      patterns:
+        # pam_unix(sshd:session): session opened for user fusion(uid=1004) by fusion(uid=0)
+        - "session opened for user %{user.name:notspace}(%{user.id}) by %{user.effective.name:notspace}(%{user.effective.id})"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: ssh_session_opened
+          event.type_id: auth_ssh_session_opened
+
+    auth_ssh_session_closed:
+      strategy: dissect
+      patterns:
+        # pam_unix(sshd:session): session closed for user fusion
+        - "session closed for user %{user.name:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: end
+          event.action: ssh_session_closed
+          event.type_id: auth_ssh_session_closed
+
+    auth_ssh_disconnect:
+      strategy: dissect
+      patterns:
+        # Received disconnect from 10.8.0.46 port 49634:11: disconnected by user
+        - "Received disconnect from %{source.ip:ip} port %{source.port:int}:%{?reason}"
+        - "Received disconnect from %{source.ip:ip}:%{?reason}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.action: disconnect
+          event.type_id: auth_ssh_disconnect
+
+    auth_ssh_disconnected:
+      strategy: dissect
+      patterns:
+        # Disconnected from user fusion 10.8.0.46 port 49634
+        - "Disconnected from user %{user.name:notspace} %{source.ip:ip} port %{source.port:int}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.action: disconnected
+          event.type_id: auth_ssh_disconnected
+
+    auth_ssh_server_listen:
+      strategy: dissect
+      patterns:
+        # Server listening on 0.0.0.0 port 22.
+        - "Server listening on %{server.address:notspace} port %{server.port:int}."
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: network
+          event.action: server_start
+          event.type_id: auth_ssh_server_listen
+
+    # =================== CRON Session ===================
+
+    auth_cron_session_opened:
+      strategy: dissect
+      patterns:
+        - "session opened for user %{user.name:notspace}(%{user.id}) by %{user.effective.name:notspace}(%{user.effective.id})"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: cron_session_opened
+          event.type_id: auth_cron_session_opened
+
+    auth_cron_session_closed:
+      strategy: dissect
+      patterns:
+        - "session closed for user %{user.name:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: end
+          event.action: cron_session_closed
+          event.type_id: auth_cron_session_closed
+
+    # =================== Sudo / Su ===================
+
+    auth_sudo_command:
+      strategy: dissect
+      patterns:
+        # summersoc : TTY=pts/0 ; PWD=/home/summersoc ; USER=root ; COMMAND=/usr/bin/su
+        - "%{user.name:notspace} : TTY=%{tty:notspace} ; PWD=%{cwd:notspace} ; USER=%{user.target.name:notspace} ; COMMAND=%{process.command_line}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: process
+          event.action: sudo_command
+          event.type_id: auth_sudo_command
+
+    auth_sudo_session_opened:
+      strategy: dissect
+      patterns:
+        # pam_unix(sudo:session): session opened for user root(uid=0) by summersoc(uid=1000)
+        - "session opened for user %{user.target.name:notspace}(%{user.target.id}) by %{user.name:notspace}(%{user.id})"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: sudo_session_opened
+          event.type_id: auth_sudo_session_opened
+
+    auth_sudo_session_closed:
+      strategy: dissect
+      patterns:
+        - "session closed for user %{user.target.name:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: end
+          event.action: sudo_session_closed
+          event.type_id: auth_sudo_session_closed
+
+    auth_su_switch:
+      strategy: dissect
+      patterns:
+        # (to root) root on pts/1
+        - "(to %{user.target.name:notspace}) %{user.name:notspace} on %{tty:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: authentication
+          event.action: su_switch
+          event.type_id: auth_su_switch
+
+    auth_su_session_opened:
+      strategy: dissect
+      patterns:
+        # pam_unix(su:session): session opened for user root(uid=0) by summersoc(uid=0)
+        - "session opened for user %{user.target.name:notspace}(%{user.target.id}) by %{user.name:notspace}(%{user.id})"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: su_session_opened
+          event.type_id: auth_su_session_opened
+
+    auth_su_session_closed:
+      strategy: dissect
+      patterns:
+        - "session closed for user %{user.target.name:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: end
+          event.action: su_session_closed
+          event.type_id: auth_su_session_closed
+
+    # =================== systemd-logind ===================
+
+    auth_logind_new_session:
+      strategy: dissect
+      patterns:
+        # New session 1811 of user summersoc.
+        - "New session %{session.id:notspace} of user %{user.name:notspace}."
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: logind_new_session
+          event.type_id: auth_logind_new_session
+
+    auth_logind_session_logout:
+      strategy: dissect
+      patterns:
+        # Session 1811 logged out. Waiting for processes to exit.
+        - "Session %{session.id:notspace} logged out.%{?rest}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: end
+          event.action: logind_session_logout
+          event.type_id: auth_logind_session_logout
+
+    auth_logind_removed_session:
+      strategy: dissect
+      patterns:
+        # Removed session 1811.
+        - "Removed session %{session.id:notspace}."
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.action: logind_removed_session
+          event.type_id: auth_logind_removed_session
+
+    # =================== systemd-user ===================
+
+    auth_systemd_user_session_opened:
+      strategy: dissect
+      patterns:
+        - "session opened for user %{user.name:notspace}(%{user.id}) by %{user.effective.name:notspace}(%{user.effective.id})"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: systemd_user_session_opened
+          event.type_id: auth_systemd_user_session_opened
+
+    auth_systemd_user_session_closed:
+      strategy: dissect
+      patterns:
+        - "session closed for user %{user.name:notspace}"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: end
+          event.action: systemd_user_session_closed
+          event.type_id: auth_systemd_user_session_closed
+
+    # =================== login ===================
+
+    auth_login_session_opened:
+      strategy: dissect
+      patterns:
+        - "session opened for user %{user.name:notspace}(%{user.id}) by %{user.effective.name:notspace}(%{user.effective.id})"
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: session
+          event.type: start
+          event.action: login_session_opened
+          event.type_id: auth_login_session_opened
+
+    # =================== System / Boot ===================
+
+    auth_logind_new_seat:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: host
+          event.action: new_seat
+          event.type_id: auth_logind_new_seat
+
+    auth_polkitd:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: host
+          event.action: polkitd
+          event.type_id: auth_polkitd
+
+    auth_pam_module_error:
+      strategy: dissect
+      patterns: []
+      ecs:
+        static:
+          event.dataset: auth
+          event.category: host
+          event.action: pam_module_error
+          event.outcome: failure
+          event.type_id: auth_pam_module_error
+
+  generic_parser:
+    enabled: true
+    strategy: regex
+
+    patterns:
+      - name: generic_auth
+        regex: '(?P<process>[^\[]+)\[(?P<pid>\d+)\]: (?P<message>.*)'
+
+        ecs:
+          process: process.name
+          pid: process.pid
+          message: message
+
+  raw_ingestion:
+    enabled: true
+    preserve_original: true
+
+    fields:
+      - event.original
+      - message
+      - host.name
+      - process.name
+      - process.pid
+
+syslog:
+  bsd_format:
+    timestamp_fields: 3
+    hostname_offset: 3
+    process_offset: 4
+
+  iso_format:
+    timestamp_fields: 1
+    hostname_offset: 1
+    process_offset: 2
